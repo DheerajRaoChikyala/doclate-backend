@@ -1,0 +1,25 @@
+# Django core
+Django>=5.1,<5.2
+djangorestframework>=3.15,<4.0
+django-cors-headers>=4.4,<5.0
+django-filter>=24.3,<25.0
+
+# Authentication
+djangorestframework-simplejwt>=5.3,<6.0
+
+# AWS
+boto3>=1.35,<2.0
+django-storages>=1.14,<2.0
+
+# Database
+psycopg2-binary>=2.9,<3.0
+
+# PDF generation
+WeasyPrint>=62.0,<63.0
+
+# Environment
+python-decouple>=3.8,<4.0
+
+# Utilities (Pillow removed — not compatible with Python 3.14 yet)
+celery>=5.4,<6.0
+redis>=5.0,<6.0
