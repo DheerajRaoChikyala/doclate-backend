@@ -22,7 +22,7 @@ class TemplateViewSet(viewsets.ReadOnlyModelViewSet):
     """
 
     queryset = Template.objects.all()
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.AllowAny]
     filterset_fields = ["category", "pack"]
     search_fields = ["name", "description"]
 

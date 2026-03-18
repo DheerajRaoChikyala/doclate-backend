@@ -6,10 +6,36 @@ Every operation from the frontend AppState interface has a corresponding endpoin
 
 import uuid
 from django.utils import timezone
-from rest_framework import viewsets, status, generics
+from django.conf import settings
+from rest_framework import viewsets, status, generics, permissions
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.views import APIView
+
+# In DEBUG mode, allow unauthenticated access so the frontend works before login UI exists.
+# In production, the global IsAuthenticated default kicks in.
+_DEV_PERMS = [permissions.AllowAny] if settings.DEBUG else [permissions.IsAuthenticated]
+
+
+def _get_user_or_none(request):
+    """Return the authenticated user, or None for anonymous requests in DEBUG mode."""
+    if request.user and request.user.is_authenticated:
+        return request.user
+    return None
+
+
+def _actor_name(request):
+    """Return the actor display name for audit events."""
+    user = _get_user_or_none(request)
+    if user:
+        return user.get_full_name() or user.username
+    return "System"
+
+
+def _user_org(request):
+    """Return the user's organization, or None."""
+    user = _get_user_or_none(request)
+    return user.organization if user else None
 
 from .models import Document, Folder, VersionEntry, AuditEvent
 from .serializers import (
@@ -52,12 +78,16 @@ class DocumentViewSet(viewsets.ModelViewSet):
     POST   /api/v1/documents/<id>/tags/            — add/remove tags
     """
 
+    permission_classes = _DEV_PERMS
     filterset_fields = ["status", "category", "template_name", "starred", "locked", "folder"]
     search_fields = ["title", "doc_id", "tags"]
     ordering_fields = ["updated_at", "created_at", "title", "status"]
 
     def get_queryset(self):
-        return Document.objects.filter(owner=self.request.user)
+        if self.request.user.is_authenticated:
+            return Document.objects.filter(owner=self.request.user)
+        # In DEBUG mode with anonymous access, return all documents
+        return Document.objects.all()
 
     def get_serializer_class(self):
         if self.action == "list":
@@ -75,8 +105,8 @@ class DocumentViewSet(viewsets.ModelViewSet):
         doc = Document(
             id=str(uuid.uuid4()),
             title=title,
-            owner=self.request.user,
-            organization=self.request.user.organization,
+            owner=_get_user_or_none(self.request),
+            organization=_user_org(self.request),
         )
 
         if template_id:
@@ -98,7 +128,7 @@ class DocumentViewSet(viewsets.ModelViewSet):
         AuditEvent.objects.create(
             document=doc,
             event_type="document.created",
-            actor=self.request.user.get_full_name() or self.request.user.username,
+            actor=_actor_name(self.request),
             description=f"Document created: {title}",
         )
 
@@ -124,7 +154,7 @@ class DocumentViewSet(viewsets.ModelViewSet):
             id=str(uuid.uuid4()),
             title=f"{doc.title} (Copy)",
             category=doc.category,
-            owner=request.user,
+            owner=_get_user_or_none(request),
             organization=doc.organization,
             template=doc.template,
             template_name=doc.template_name,
@@ -216,7 +246,7 @@ class DocumentViewSet(viewsets.ModelViewSet):
             document=doc,
             version=doc.version,
             status=doc.status,
-            actor=request.user.get_full_name() or request.user.username,
+            actor=_actor_name(request),
             note=request.data.get("note", f"Version {doc.version} created"),
             sha256=doc.sha256,
             canvas_data_snapshot=doc.canvas_data,
@@ -245,7 +275,11 @@ class DocumentViewSet(viewsets.ModelViewSet):
         folder_id = request.data.get("folder_id")
         if folder_id:
             try:
-                folder = Folder.objects.get(id=folder_id, owner=request.user)
+                user = _get_user_or_none(request)
+                qs = Folder.objects.filter(id=folder_id)
+                if user:
+                    qs = qs.filter(owner=user)
+                folder = qs.get()
                 doc.folder = folder
             except Folder.DoesNotExist:
                 return Response({"error": "Folder not found"}, status=status.HTTP_404_NOT_FOUND)
@@ -278,7 +312,7 @@ class DocumentViewSet(viewsets.ModelViewSet):
         AuditEvent.objects.create(
             document=doc,
             event_type=event_type,
-            actor=self.request.user.get_full_name() or self.request.user.username,
+            actor=_actor_name(self.request),
             description=description,
         )
 
@@ -292,6 +326,7 @@ class BulkOperationsView(APIView):
     POST /api/v1/documents/bulk/
     Body: { action: "delete"|"archive"|"move_to_folder"|"export", ids: [...], ... }
     """
+    permission_classes = _DEV_PERMS
 
     def post(self, request):
         action = request.data.get("action")
@@ -300,7 +335,10 @@ class BulkOperationsView(APIView):
         if not ids:
             return Response({"error": "ids required"}, status=status.HTTP_400_BAD_REQUEST)
 
-        docs = Document.objects.filter(id__in=ids, owner=request.user)
+        user = _get_user_or_none(request)
+        docs = Document.objects.filter(id__in=ids)
+        if user:
+            docs = docs.filter(owner=user)
 
         if action == "delete":
             count = docs.count()
@@ -315,7 +353,10 @@ class BulkOperationsView(APIView):
             folder_id = request.data.get("folder_id")
             if folder_id:
                 try:
-                    Folder.objects.get(id=folder_id, owner=request.user)
+                    qs = Folder.objects.filter(id=folder_id)
+                    if user:
+                        qs = qs.filter(owner=user)
+                    qs.get()
                 except Folder.DoesNotExist:
                     return Response({"error": "Folder not found"}, status=status.HTTP_404_NOT_FOUND)
             count = docs.update(folder_id=folder_id)
@@ -342,19 +383,23 @@ class FolderViewSet(viewsets.ModelViewSet):
     """
 
     serializer_class = FolderSerializer
+    permission_classes = _DEV_PERMS
 
     def get_queryset(self):
-        return Folder.objects.filter(owner=self.request.user)
+        user = _get_user_or_none(self.request)
+        if user:
+            return Folder.objects.filter(owner=user)
+        return Folder.objects.all()
 
     def perform_create(self, serializer):
-        serializer.save(owner=self.request.user, id=str(uuid.uuid4()))
+        serializer.save(owner=_get_user_or_none(self.request), id=str(uuid.uuid4()))
 
     @action(detail=True, methods=["post"])
     def copy(self, request, pk=None):
         folder = self.get_object()
         new_folder = Folder.objects.create(
             id=str(uuid.uuid4()),
-            owner=request.user,
+            owner=_get_user_or_none(request),
             name=f"{folder.name} (Copy)",
             color=folder.color,
             parent=folder.parent,
@@ -368,7 +413,11 @@ class FolderViewSet(viewsets.ModelViewSet):
         target_parent_id = request.data.get("parent_id")
         if target_parent_id:
             try:
-                parent = Folder.objects.get(id=target_parent_id, owner=request.user)
+                user = _get_user_or_none(request)
+                qs = Folder.objects.filter(id=target_parent_id)
+                if user:
+                    qs = qs.filter(owner=user)
+                parent = qs.get()
                 folder.parent = parent
             except Folder.DoesNotExist:
                 return Response({"error": "Target folder not found"}, status=status.HTTP_404_NOT_FOUND)
@@ -387,18 +436,20 @@ class ImportDocumentView(APIView):
     POST /api/v1/documents/import/
     Body: { fileName, templateName, tags?, folderId?, file (multipart) }
     """
+    permission_classes = _DEV_PERMS
 
     def post(self, request):
         file_name = request.data.get("fileName", "Imported Document")
         template_name = request.data.get("templateName", "")
         tags = request.data.get("tags", [])
         folder_id = request.data.get("folderId")
+        user = _get_user_or_none(request)
 
         doc = Document(
             id=str(uuid.uuid4()),
             title=file_name,
-            owner=request.user,
-            organization=request.user.organization,
+            owner=user,
+            organization=_user_org(request),
             template_name=template_name,
             tags=tags if isinstance(tags, list) else [],
             source_file=file_name,
@@ -407,7 +458,10 @@ class ImportDocumentView(APIView):
 
         if folder_id:
             try:
-                folder = Folder.objects.get(id=folder_id, owner=request.user)
+                qs = Folder.objects.filter(id=folder_id)
+                if user:
+                    qs = qs.filter(owner=user)
+                folder = qs.get()
                 doc.folder = folder
             except Folder.DoesNotExist:
                 pass

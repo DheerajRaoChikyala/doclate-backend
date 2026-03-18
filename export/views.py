@@ -6,23 +6,30 @@ Aligned with:
   - issue-modal.tsx → handleIssue() flow
 """
 
+from django.conf import settings
 from django.http import HttpResponse
-from rest_framework import status
+from rest_framework import status, permissions
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from documents.models import Document
 from .services import fingerprint_document, generate_document_pdf, sha256_hex
 
+_DEV_PERMS = [permissions.AllowAny] if settings.DEBUG else [permissions.IsAuthenticated]
+
+
+def _actor_name(request):
+    if request.user and request.user.is_authenticated:
+        return request.user.get_full_name() or request.user.username
+    return "System"
+
 
 class FingerprintView(APIView):
     """
     POST /api/v1/export/fingerprint/
     Compute SHA-256 fingerprint for a document.
-
-    Body: { docId, title, docType, invoiceNo?, issueDate?, totalAmount? }
-    Returns: { sha256, generatedAt, contentSnippet }
     """
+    permission_classes = _DEV_PERMS
 
     def post(self, request):
         fp = fingerprint_document(
@@ -40,14 +47,15 @@ class ExportPDFView(APIView):
     """
     POST /api/v1/export/pdf/<doc_id>/
     Generate and download PDF for a document.
-
-    Returns: PDF file bytes with Content-Type application/pdf
-    Also stores sha256 on the document and creates a version entry.
     """
+    permission_classes = _DEV_PERMS
 
     def post(self, request, doc_id):
         try:
-            document = Document.objects.get(id=doc_id, owner=request.user)
+            qs = Document.objects.filter(id=doc_id)
+            if request.user and request.user.is_authenticated:
+                qs = qs.filter(owner=request.user)
+            document = qs.get()
         except Document.DoesNotExist:
             return Response(
                 {"error": "Document not found"},
@@ -62,10 +70,7 @@ class ExportPDFView(APIView):
                 status=status.HTTP_501_NOT_IMPLEMENTED,
             )
 
-        # Compute SHA-256 of the actual PDF bytes
         pdf_sha256 = sha256_hex(pdf_bytes)
-
-        # Update document with fingerprint
         document.sha256 = pdf_sha256
         document.save(update_fields=["sha256"])
 
@@ -80,13 +85,15 @@ class IssueDocumentView(APIView):
     POST /api/v1/export/issue/<doc_id>/
     Issue a document: compute fingerprint, update status to 'issued',
     create version entry, and return the fingerprint.
-
-    This mirrors the handleIssue() flow in issue-modal.tsx.
     """
+    permission_classes = _DEV_PERMS
 
     def post(self, request, doc_id):
         try:
-            document = Document.objects.get(id=doc_id, owner=request.user)
+            qs = Document.objects.filter(id=doc_id)
+            if request.user and request.user.is_authenticated:
+                qs = qs.filter(owner=request.user)
+            document = qs.get()
         except Document.DoesNotExist:
             return Response(
                 {"error": "Document not found"},
@@ -99,7 +106,6 @@ class IssueDocumentView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # Compute content fingerprint
         canvas = document.canvas_data or {}
         fp = fingerprint_document(
             doc_id=document.doc_id,
@@ -110,34 +116,28 @@ class IssueDocumentView(APIView):
             total_amount=canvas.get("grandTotalValue", ""),
         )
 
-        # Update document status
         from django.utils import timezone
-
         document.status = "issued"
         document.sha256 = fp["sha256"]
         document.issued_at = timezone.now()
         document.save(update_fields=["status", "sha256", "issued_at", "updated_at"])
 
-        # Create version entry
         from documents.models import VersionEntry
-
         VersionEntry.objects.create(
             document=document,
             version=document.version,
             status="issued",
-            actor=request.user.get_full_name() or request.user.username,
+            actor=_actor_name(request),
             note="Document issued",
             sha256=fp["sha256"],
             canvas_data_snapshot=document.canvas_data,
         )
 
-        # Create audit event
         from documents.models import AuditEvent
-
         AuditEvent.objects.create(
             document=document,
             event_type="document.issued",
-            actor=request.user.get_full_name() or request.user.username,
+            actor=_actor_name(request),
             description=f"Document issued with SHA-256: {fp['sha256'][:16]}...",
         )
 
